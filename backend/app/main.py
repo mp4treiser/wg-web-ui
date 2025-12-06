@@ -1,3 +1,5 @@
+import io
+import zipfile
 from datetime import timedelta
 from typing import Dict, List, Set
 
@@ -17,6 +19,7 @@ from .wg_easy_client import (
     delete_client,
     disable_client,
     enable_client,
+    fetch_client_configuration,
     fetch_qrcode_svg,
     get_traffic_delta_for_period,
     get_traffic_history,
@@ -665,6 +668,225 @@ async def delete_logical_user(
     db.commit()
 
     return {"success": True}
+
+
+@app.post("/users/{user_id}/servers/all")
+async def attach_user_to_all_servers(
+    user_id: int,
+    payload: schemas.MassAttachRequest,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    """
+    Массовое создание peers для пользователя на всех доступных серверах.
+    Пропускает сервера, где у пользователя уже есть peer.
+    """
+    user = db.query(LogicalUser).filter(LogicalUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    servers = db.query(WgServer).all()
+    if not servers:
+        return {"success": True, "created": 0, "skipped": 0, "errors": []}
+
+    created = 0
+    skipped = 0
+    errors: List[Dict[str, str]] = []
+
+    for server in servers:
+        # Проверяем, есть ли уже peer на этом сервере
+        existing = (
+            db.query(UserServerBinding)
+            .filter(
+                UserServerBinding.logical_user_id == user.id,
+                UserServerBinding.server_id == server.id,
+            )
+            .first()
+        )
+        if existing:
+            skipped += 1
+            continue
+
+        client_name = user.name
+        client_id, error = await create_client(db, server, client_name, payload.expires_at)
+        if error or client_id is None:
+            errors.append({"server": server.name, "error": error or "Failed to create client"})
+            continue
+
+        binding = UserServerBinding(
+            logical_user_id=user.id,
+            server_id=server.id,
+            wg_client_id=client_id,
+            wg_client_name=client_name,
+            expires_at=payload.expires_at,
+        )
+        db.add(binding)
+        created += 1
+
+    db.commit()
+
+    return {
+        "success": True,
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+@app.get("/users/{user_id}/qrcodes")
+async def get_user_all_qrcodes(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    """
+    Возвращает список всех QR кодов для пользователя (как SVG URLs).
+    """
+    user = db.query(LogicalUser).filter(LogicalUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    bindings = (
+        db.query(UserServerBinding)
+        .filter(UserServerBinding.logical_user_id == user_id)
+        .all()
+    )
+
+    result = []
+    for b in bindings:
+        server = db.query(WgServer).filter(WgServer.id == b.server_id).first()
+        if not server:
+            continue
+        result.append(
+            {
+                "server_id": server.id,
+                "server_name": server.name,
+                "client_id": b.wg_client_id,
+                "qrcode_url": f"/servers/{server.id}/clients/{b.wg_client_id}/qrcode",
+            }
+        )
+
+    return {"user_id": user.id, "user_name": user.name, "qrcodes": result}
+
+
+@app.get("/servers/{server_id}/clients/{client_id}/configuration")
+async def get_client_configuration(
+    server_id: int,
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    """
+    Скачивает конфигурационный файл клиента.
+    """
+    server = db.query(WgServer).filter(WgServer.id == server_id).first()
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    # Получаем имя пользователя и сервера для имени файла
+    binding = (
+        db.query(UserServerBinding)
+        .filter(
+            UserServerBinding.server_id == server.id,
+            UserServerBinding.wg_client_id == client_id,
+        )
+        .first()
+    )
+
+    if binding:
+        user = db.query(LogicalUser).filter(LogicalUser.id == binding.logical_user_id).first()
+        # Используем точно такой же формат, как в массовом скачивании
+        user_name = (user.name if user else "unknown").replace(" ", "_").replace("-", "_")
+        server_name = server.name.replace(" ", "_").replace("-", "_")
+        filename = f"{user_name}_{server_name}.conf"
+    else:
+        server_name = server.name.replace(" ", "_").replace("-", "_")
+        filename = f"client-{client_id}_{server_name}.conf"
+
+    config_bytes, error = await fetch_client_configuration(db, server, client_id)
+    if error or config_bytes is None:
+        raise HTTPException(status_code=400, detail=error or "Failed to fetch configuration")
+
+    # Используем точно такой же формат имени, как в массовом скачивании
+    # Имя уже обработано (пробелы и дефисы заменены на подчёркивания)
+    # Для HTTP заголовка проверяем, можно ли закодировать в latin-1
+    try:
+        filename.encode("latin-1")
+        safe_filename = filename
+    except UnicodeEncodeError:
+        # Если есть кириллица или другие не-latin-1 символы, используем безопасное имя
+        # Но стараемся сохранить структуру: user_server.conf
+        if binding and user:
+            safe_filename = f"user_{binding.logical_user_id}_server_{server.id}.conf"
+        else:
+            safe_filename = f"client-{client_id}.conf"
+    
+    return Response(
+        content=config_bytes,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
+
+
+@app.get("/users/{user_id}/configurations")
+async def get_user_all_configurations(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(get_current_admin),
+):
+    """
+    Скачивает ZIP архив со всеми конфигурационными файлами пользователя.
+    """
+    user = db.query(LogicalUser).filter(LogicalUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    bindings = (
+        db.query(UserServerBinding)
+        .filter(UserServerBinding.logical_user_id == user_id)
+        .all()
+    )
+
+    if not bindings:
+        raise HTTPException(status_code=404, detail="No peers found for this user")
+
+    # Создаём ZIP в памяти
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for b in bindings:
+            server = db.query(WgServer).filter(WgServer.id == b.server_id).first()
+            if not server:
+                continue
+
+            config_bytes, error = await fetch_client_configuration(db, server, b.wg_client_id)
+            if error or config_bytes is None:
+                continue
+
+            # Используем имя без проблемных символов для WireGuard
+            user_name = user.name.replace(" ", "_").replace("-", "_")
+            server_name = server.name.replace(" ", "_").replace("-", "_")
+            filename = f"{user_name}_{server_name}.conf"
+            zip_file.writestr(filename, config_bytes)
+
+    zip_buffer.seek(0)
+    # Используем имя без проблемных символов
+    user_name = user.name.replace(" ", "_").replace("-", "_")
+    zip_filename = f"{user_name}_configs.zip"
+
+    # Кодируем имя файла для поддержки кириллицы в заголовке
+    # Starlette требует latin-1, поэтому используем только ASCII-совместимое имя
+    try:
+        ascii_filename = zip_filename.encode("ascii", "ignore").decode("ascii")
+        if not ascii_filename:
+            ascii_filename = f"user-{user_id}_configs.zip"
+    except Exception:
+        ascii_filename = f"user-{user_id}_configs.zip"
+
+    return StreamingResponse(
+        iter([zip_buffer.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{ascii_filename}"'},
+    )
 
 
 

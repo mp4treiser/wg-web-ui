@@ -26,6 +26,13 @@ export default function UsersPage() {
   const [updatingExpiryId, setUpdatingExpiryId] = useState<number | null>(null);
   const [updatingExpiryValue, setUpdatingExpiryValue] = useState("");
   const [busyClientId, setBusyClientId] = useState<number | null>(null);
+  const [massCreating, setMassCreating] = useState(false);
+  const [allQrCodes, setAllQrCodes] = useState<Array<{
+    server_id: number;
+    server_name: string;
+    client_id: number;
+    qrcode_url: string;
+  }> | null>(null);
 
   async function loadUsers() {
     setLoadingUsers(true);
@@ -255,6 +262,84 @@ export default function UsersPage() {
     await loadUsers();
   }
 
+  async function handleMassCreateBindings(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedUserId) return;
+    setMassCreating(true);
+    try {
+      const result = await api.post(`/users/${selectedUserId}/servers/all`, {
+        expires_at: bindExpiry ? new Date(bindExpiry).toISOString() : null
+      });
+      setBindExpiry("");
+      await loadBindings(selectedUserId);
+      if (result.data.created > 0 || result.data.skipped > 0) {
+        alert(
+          `Создано peers: ${result.data.created}, пропущено (уже есть): ${result.data.skipped}${
+            result.data.errors.length > 0
+              ? `, ошибок: ${result.data.errors.length}`
+              : ""
+          }`
+        );
+      }
+    } finally {
+      setMassCreating(false);
+    }
+  }
+
+  async function handleShowAllQRCodes() {
+    if (!selectedUserId) return;
+    try {
+      const { data } = await api.get(`/users/${selectedUserId}/qrcodes`);
+      setAllQrCodes(data.qrcodes);
+    } catch (err) {
+      alert("Ошибка при загрузке QR кодов");
+    }
+  }
+
+  async function handleDownloadConfig(binding: UserServerBinding) {
+    try {
+      const response = await api.get(
+        `/servers/${binding.server_id}/clients/${binding.wg_client_id}/configuration`,
+        { responseType: "blob" }
+      );
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      const server = servers.find(s => s.id === binding.server_id);
+      const user = selectedUser;
+      // Используем тот же формат, что и в массовом скачивании (с подчёркиваниями)
+      const userName = (user?.name || "unknown").replace(/[\s-]/g, "_");
+      const serverName = (server?.name || `server-${binding.server_id}`).replace(/[\s-]/g, "_");
+      link.setAttribute("download", `${userName}_${serverName}.conf`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      alert("Ошибка при скачивании конфига");
+    }
+  }
+
+  async function handleDownloadAllConfigs() {
+    if (!selectedUserId) return;
+    try {
+      const response = await api.get(`/users/${selectedUserId}/configurations`, {
+        responseType: "blob"
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      const user = selectedUser;
+      link.setAttribute("download", `${user?.name || "user"}_configs.zip`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      alert("Ошибка при скачивании конфигов");
+    }
+  }
+
   const selectedUser = useMemo(
     () => users.find(u => u.id === selectedUserId) ?? null,
     [users, selectedUserId]
@@ -317,7 +402,7 @@ export default function UsersPage() {
               )}
             </div>
             {selectedUser && (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <button
                   type="button"
                   onClick={() => void handleDisableAllForUser()}
@@ -331,6 +416,20 @@ export default function UsersPage() {
                   className="text-xs px-3 py-1 rounded border border-slate-700 text-emerald-300 hover:border-emerald-400 hover:text-emerald-400 transition"
                 >
                   Вкл. все peers
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleShowAllQRCodes()}
+                  className="text-xs px-3 py-1 rounded border border-slate-700 text-sky-300 hover:border-sky-400 hover:text-sky-400 transition"
+                >
+                  Все QR коды
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadAllConfigs()}
+                  className="text-xs px-3 py-1 rounded border border-slate-700 text-purple-300 hover:border-purple-400 hover:text-purple-400 transition"
+                >
+                  Скачать все конфиги
                 </button>
                 <button
                   type="button"
@@ -455,13 +554,22 @@ export default function UsersPage() {
                           </div>
                           {server && (
                             <div className="flex flex-col items-end gap-1">
-                              <button
-                                type="button"
-                                onClick={() => setQrBinding(b)}
-                                className="text-xs px-3 py-1 rounded border border-slate-700 hover:border-accent hover:text-accent transition text-center"
-                              >
-                                QR код
-                              </button>
+                              <div className="flex flex-col gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => setQrBinding(b)}
+                                  className="text-xs px-3 py-1 rounded border border-slate-700 hover:border-accent hover:text-accent transition text-center"
+                                >
+                                  QR код
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDownloadConfig(b)}
+                                  className="text-xs px-3 py-1 rounded border border-slate-700 hover:border-purple-400 hover:text-purple-300 transition text-center"
+                                >
+                                  Скачать конфиг
+                                </button>
+                              </div>
                               <div className="flex gap-1">
                                 <button
                                   type="button"
@@ -497,49 +605,77 @@ export default function UsersPage() {
                 )}
               </div>
 
-              <div className="border-t border-slate-800 pt-3">
-                <h3 className="text-xs font-semibold text-gray-300 mb-2">
-                  Добавить peer на сервер
-                </h3>
-                <form
-                  className="grid md:grid-cols-3 gap-3 items-end"
-                  onSubmit={handleCreateBinding}
-                >
-                  <div>
-                    <label className="block text-xs mb-1">Сервер</label>
-                    <select
-                      className="w-full rounded-md bg-slate-900 border border-slate-700 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-accent"
-                      value={bindServerId}
-                      onChange={e =>
-                        setBindServerId(e.target.value ? Number(e.target.value) : "")
-                      }
-                      required
-                    >
-                      <option value="">Выберите сервер</option>
-                      {servers.map(s => (
-                        <option key={s.id} value={s.id}>
-                          {s.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs mb-1">Срок действия (опционально)</label>
-                    <input
-                      type="date"
-                      className="w-full rounded-md bg-slate-900 border border-slate-700 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-accent"
-                      value={bindExpiry}
-                      onChange={e => setBindExpiry(e.target.value)}
-                    />
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={creatingBinding}
-                    className="mt-1 inline-flex items-center justify-center rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-slate-900 hover:bg-sky-300 transition disabled:opacity-60"
+              <div className="border-t border-slate-800 pt-3 space-y-3">
+                <div>
+                  <h3 className="text-xs font-semibold text-gray-300 mb-2">
+                    Добавить peer на сервер
+                  </h3>
+                  <form
+                    className="grid md:grid-cols-3 gap-3 items-end"
+                    onSubmit={handleCreateBinding}
                   >
-                    {creatingBinding ? "Создание..." : "Создать peer"}
-                  </button>
-                </form>
+                    <div>
+                      <label className="block text-xs mb-1">Сервер</label>
+                      <select
+                        className="w-full rounded-md bg-slate-900 border border-slate-700 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-accent"
+                        value={bindServerId}
+                        onChange={e =>
+                          setBindServerId(e.target.value ? Number(e.target.value) : "")
+                        }
+                        required
+                      >
+                        <option value="">Выберите сервер</option>
+                        {servers.map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs mb-1">Срок действия (опционально)</label>
+                      <input
+                        type="date"
+                        className="w-full rounded-md bg-slate-900 border border-slate-700 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-accent"
+                        value={bindExpiry}
+                        onChange={e => setBindExpiry(e.target.value)}
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={creatingBinding}
+                      className="mt-1 inline-flex items-center justify-center rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-slate-900 hover:bg-sky-300 transition disabled:opacity-60"
+                    >
+                      {creatingBinding ? "Создание..." : "Создать peer"}
+                    </button>
+                  </form>
+                </div>
+                <div>
+                  <h3 className="text-xs font-semibold text-gray-300 mb-2">
+                    Массовое добавление на все серверы
+                  </h3>
+                  <form
+                    className="grid md:grid-cols-2 gap-3 items-end"
+                    onSubmit={handleMassCreateBindings}
+                  >
+                    <div>
+                      <label className="block text-xs mb-1">Срок действия (опционально)</label>
+                      <input
+                        type="date"
+                        className="w-full rounded-md bg-slate-900 border border-slate-700 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-accent"
+                        value={bindExpiry}
+                        onChange={e => setBindExpiry(e.target.value)}
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={massCreating}
+                      className="mt-1 inline-flex items-center justify-center rounded-md bg-slate-800 px-3 py-1.5 text-xs font-medium text-gray-100 border border-slate-700 hover:border-accent hover:text-accent transition disabled:opacity-60"
+                    >
+                      {massCreating ? "Создание..." : "Создать peers на всех серверах"}
+                    </button>
+                  </form>
+                </div>
               </div>
             </>
           )}
@@ -643,6 +779,37 @@ export default function UsersPage() {
             <p className="mt-3 text-[11px] text-gray-400">
               Наведи камеру WireGuard-клиента на QR-код. Окно можно закрыть крестиком.
             </p>
+          </div>
+        </div>
+      )}
+
+      {allQrCodes && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 overflow-y-auto p-4">
+          <div className="bg-card border border-slate-700 rounded-xl p-4 w-full max-w-4xl relative max-h-[90vh] overflow-y-auto">
+            <button
+              type="button"
+              onClick={() => setAllQrCodes(null)}
+              className="absolute top-2 right-2 text-xs text-gray-400 hover:text-accent"
+            >
+              ✕
+            </button>
+            <h2 className="text-sm font-semibold mb-4">Все QR коды пользователя</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {allQrCodes.map(qr => (
+                <div key={`${qr.server_id}-${qr.client_id}`} className="bg-slate-900 rounded-lg p-3">
+                  <p className="text-xs text-gray-300 mb-2">
+                    {qr.server_name} (clientId: {qr.client_id})
+                  </p>
+                  <div className="bg-white rounded-md p-2 flex items-center justify-center">
+                    <img
+                      src={`${API_BASE_URL}${qr.qrcode_url}`}
+                      alt={`QR ${qr.server_name}`}
+                      className="max-w-full h-auto"
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

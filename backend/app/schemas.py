@@ -102,7 +102,7 @@ class UserServerBindingWithStatusOut(UserServerBindingOut):
     enabled: Optional[bool] = None
 
 
-class UserServerBindingWithStatusOut(UserServerBindingOut):
-    enabled: Optional[bool] = None
+class MassAttachRequest(BaseModel):
+    expires_at: Optional[datetime] = None
 
 

@@ -1,4 +1,5 @@
 import { FormEvent, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 
 interface Props {
@@ -6,6 +7,7 @@ interface Props {
 }
 
 export default function LoginPage({ onLoggedIn }: Props) {
+  const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -18,6 +20,7 @@ export default function LoginPage({ onLoggedIn }: Props) {
     try {
       await api.post("/auth/login", { email, password });
       onLoggedIn?.();
+      navigate("/");
     } catch (err) {
       setError("Неверный email или пароль");
     } finally {

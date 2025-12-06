@@ -425,4 +425,34 @@ async def delete_client(db: Session, server: WgServer, client_id: int) -> Option
     return None
 
 
+async def fetch_client_configuration(
+    db: Session, server: WgServer, client_id: int
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Скачивает конфигурационный файл клиента (WireGuard .conf).
+    Возвращает (content_bytes, error_message).
+    """
+    cookie, error = await _ensure_session_cookie(db, server)
+    if error or not cookie:
+        return None, error or "No cookie"
+
+    url = f"{server.base_url.rstrip('/')}/api/client/{client_id}/configuration"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "accept": "application/octet-stream",
+                    "cookie": f"wg-easy={cookie}",
+                },
+            )
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+    if resp.status_code != 200:
+        return None, f"get configuration failed with status {resp.status_code}: {resp.text}"
+
+    return resp.content, None
+
+
 
